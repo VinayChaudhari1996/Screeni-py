@@ -1,59 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
-from fastapi.responses import StreamingResponse
-from typing import List, Optional
+from fastapi import APIRouter, HTTPException, BackgroundTasks
+from typing import List, Optional, Dict, Any
 import asyncio
 import uuid
-import json
+import time
 from datetime import datetime
-import io
-import csv
 
 from app.schemas.screening import (
-    ScreeningRequest, ScreeningResponse, ScreeningJob, 
-    ScreeningJobStatus, ScreeningConfig
+    ScreeningRequest, ScreeningResponse, ScreeningJobStatus, 
+    StockResult, ScreeningConfig
 )
-from app.services.screener import ScreenerService
-from app.services.job_manager import JobManager
-from app.core.database import get_db
-from app.models.screening import ScreeningJobModel
+from app.services.stock_fetcher import StockFetcher
+from app.services.stock_analyzer import StockAnalyzer
 
 router = APIRouter()
+
+# In-memory job storage for demo (use database in production)
+jobs_storage: Dict[str, Dict[str, Any]] = {}
 
 @router.post("/run", response_model=ScreeningResponse)
 async def run_screening(
     request: ScreeningRequest,
     background_tasks: BackgroundTasks,
-    config: Optional[ScreeningConfig] = None,
-    db = Depends(get_db)
+    config: Optional[ScreeningConfig] = None
 ):
-    """
-    Start a new stock screening job
-    """
+    """Start a new stock screening job"""
     try:
         # Generate unique job ID
         job_id = str(uuid.uuid4())
         
-        # Create job record
-        job = ScreeningJobModel(
-            job_id=job_id,
-            status=ScreeningJobStatus.PENDING,
-            request_data=request.dict(),
-            config_data=config.dict() if config else None,
-            created_at=datetime.utcnow()
-        )
-        
-        # Save to database
-        db.add(job)
-        db.commit()
+        # Initialize job
+        jobs_storage[job_id] = {
+            "job_id": job_id,
+            "status": ScreeningJobStatus.PENDING,
+            "progress": 0,
+            "total_stocks": 0,
+            "screened_stocks": 0,
+            "found_stocks": 0,
+            "created_at": datetime.utcnow(),
+            "results": [],
+            "error_message": None
+        }
         
         # Start background screening task
-        screener_service = ScreenerService()
-        background_tasks.add_task(
-            screener_service.run_screening_job,
-            job_id=job_id,
-            request=request,
-            config=config
-        )
+        background_tasks.add_task(run_screening_job, job_id, request, config)
         
         return ScreeningResponse(
             job_id=job_id,
@@ -63,172 +52,96 @@ async def run_screening(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to start screening: {str(e)}")
 
-@router.get("/status/{job_id}", response_model=ScreeningJob)
-async def get_screening_status(
-    job_id: str,
-    db = Depends(get_db)
-):
-    """
-    Get the status of a screening job
-    """
-    job = db.query(ScreeningJobModel).filter(ScreeningJobModel.job_id == job_id).first()
-    
-    if not job:
+@router.get("/status/{job_id}")
+async def get_screening_status(job_id: str):
+    """Get the status of a screening job"""
+    if job_id not in jobs_storage:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    return ScreeningJob(
-        job_id=job.job_id,
-        status=job.status,
-        progress=job.progress or 0,
-        total_stocks=job.total_stocks,
-        screened_stocks=job.screened_stocks,
-        found_stocks=job.found_stocks,
-        created_at=job.created_at,
-        completed_at=job.completed_at,
-        error_message=job.error_message
-    )
+    job = jobs_storage[job_id]
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "progress": job["progress"],
+        "total_stocks": job["total_stocks"],
+        "screened_stocks": job["screened_stocks"],
+        "found_stocks": job["found_stocks"],
+        "created_at": job["created_at"],
+        "error_message": job["error_message"]
+    }
 
 @router.get("/results/{job_id}", response_model=ScreeningResponse)
-async def get_screening_results(
-    job_id: str,
-    db = Depends(get_db)
-):
-    """
-    Get the results of a completed screening job
-    """
-    job = db.query(ScreeningJobModel).filter(ScreeningJobModel.job_id == job_id).first()
-    
-    if not job:
+async def get_screening_results(job_id: str):
+    """Get the results of a completed screening job"""
+    if job_id not in jobs_storage:
         raise HTTPException(status_code=404, detail="Job not found")
     
-    if job.status != ScreeningJobStatus.COMPLETED:
+    job = jobs_storage[job_id]
+    
+    if job["status"] != ScreeningJobStatus.COMPLETED:
         raise HTTPException(status_code=400, detail="Job not completed yet")
     
     return ScreeningResponse(
-        job_id=job.job_id,
-        status=job.status,
-        results=job.results,
-        total_found=len(job.results) if job.results else 0,
-        execution_time=job.execution_time,
-        config_used=ScreeningConfig(**job.config_data) if job.config_data else None
+        job_id=job["job_id"],
+        status=job["status"],
+        results=job["results"],
+        total_found=len(job["results"]),
+        execution_time=job.get("execution_time")
     )
 
-@router.delete("/cancel/{job_id}")
-async def cancel_screening(
-    job_id: str,
-    db = Depends(get_db)
-):
-    """
-    Cancel a running screening job
-    """
-    job = db.query(ScreeningJobModel).filter(ScreeningJobModel.job_id == job_id).first()
-    
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    if job.status not in [ScreeningJobStatus.PENDING, ScreeningJobStatus.RUNNING]:
-        raise HTTPException(status_code=400, detail="Job cannot be cancelled")
-    
-    # Update job status
-    job.status = ScreeningJobStatus.CANCELLED
-    job.completed_at = datetime.utcnow()
-    db.commit()
-    
-    # Signal job manager to cancel the job
-    job_manager = JobManager()
-    await job_manager.cancel_job(job_id)
-    
-    return {"message": "Job cancelled successfully"}
-
-@router.get("/export/{job_id}")
-async def export_results(
-    job_id: str,
-    format: str = Query("csv", regex="^(csv|json)$"),
-    db = Depends(get_db)
-):
-    """
-    Export screening results in CSV or JSON format
-    """
-    job = db.query(ScreeningJobModel).filter(ScreeningJobModel.job_id == job_id).first()
-    
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    
-    if job.status != ScreeningJobStatus.COMPLETED or not job.results:
-        raise HTTPException(status_code=400, detail="No results available")
-    
-    if format == "csv":
-        # Create CSV content
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=job.results[0].keys())
-        writer.writeheader()
-        writer.writerows([result.dict() for result in job.results])
-        
-        content = output.getvalue()
-        output.close()
-        
-        return StreamingResponse(
-            io.BytesIO(content.encode()),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=screening_results_{job_id}.csv"}
-        )
-    
-    else:  # JSON format
-        content = json.dumps([result.dict() for result in job.results], indent=2)
-        
-        return StreamingResponse(
-            io.BytesIO(content.encode()),
-            media_type="application/json",
-            headers={"Content-Disposition": f"attachment; filename=screening_results_{job_id}.json"}
-        )
-
-@router.get("/history")
-async def get_screening_history(
-    limit: int = Query(10, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db = Depends(get_db)
-):
-    """
-    Get screening job history
-    """
-    jobs = db.query(ScreeningJobModel)\
-        .order_by(ScreeningJobModel.created_at.desc())\
-        .offset(offset)\
-        .limit(limit)\
-        .all()
-    
-    return [
-        ScreeningJob(
-            job_id=job.job_id,
-            status=job.status,
-            progress=job.progress or 0,
-            total_stocks=job.total_stocks,
-            screened_stocks=job.screened_stocks,
-            found_stocks=job.found_stocks,
-            created_at=job.created_at,
-            completed_at=job.completed_at,
-            error_message=job.error_message
-        )
-        for job in jobs
-    ]
-
-@router.websocket("/ws/{job_id}")
-async def websocket_screening_progress(websocket, job_id: str):
-    """
-    WebSocket endpoint for real-time screening progress updates
-    """
-    await websocket.accept()
-    
+async def run_screening_job(job_id: str, request: ScreeningRequest, config: Optional[ScreeningConfig]):
+    """Background task to run the screening job"""
     try:
-        job_manager = JobManager()
-        async for progress_update in job_manager.get_job_progress(job_id):
-            await websocket.send_json(progress_update)
-            
-            # Break if job is completed or failed
-            if progress_update.get("status") in ["completed", "failed", "cancelled"]:
-                break
+        job = jobs_storage[job_id]
+        job["status"] = ScreeningJobStatus.RUNNING
+        
+        # Initialize services
+        fetcher = StockFetcher()
+        analyzer = StockAnalyzer()
+        
+        # Get stock list based on index type
+        if request.stock_codes:
+            stock_codes = request.stock_codes
+        elif request.index_type == "1":
+            stock_codes = await fetcher.get_nifty_50()
+        else:
+            stock_codes = await fetcher.get_all_stocks()
+        
+        job["total_stocks"] = len(stock_codes)
+        results = []
+        
+        # Screen each stock
+        for i, stock_code in enumerate(stock_codes):
+            try:
+                # Update progress
+                job["progress"] = int((i / len(stock_codes)) * 100)
+                job["screened_stocks"] = i + 1
                 
+                # Fetch and analyze stock data
+                stock_data = await fetcher.get_stock_data(stock_code)
+                if stock_data is None or stock_data.empty:
+                    continue
+                
+                # Analyze stock
+                result = await analyzer.analyze_stock(stock_code, stock_data, request, config)
+                if result:
+                    results.append(result.dict())
+                
+                # Small delay to prevent overwhelming APIs
+                await asyncio.sleep(0.1)
+                
+            except Exception as e:
+                print(f"Error screening {stock_code}: {e}")
+                continue
+        
+        # Update job with results
+        job["status"] = ScreeningJobStatus.COMPLETED
+        job["progress"] = 100
+        job["results"] = results
+        job["found_stocks"] = len(results)
+        job["completed_at"] = datetime.utcnow()
+        
     except Exception as e:
-        await websocket.send_json({"error": str(e)})
-    finally:
-        await websocket.close()
+        job["status"] = ScreeningJobStatus.FAILED
+        job["error_message"] = str(e)
+        job["completed_at"] = datetime.utcnow()
