@@ -1,6 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter
 from pydantic import BaseModel
-from typing import Dict, Any
 
 router = APIRouter()
 
@@ -17,7 +16,7 @@ class ScreeningConfig(BaseModel):
     stage_two_only: bool = True
     use_ema: bool = False
 
-# In-memory config storage for now
+# In-memory config storage
 current_config = ScreeningConfig()
 
 @router.get("/", response_model=ScreeningConfig)

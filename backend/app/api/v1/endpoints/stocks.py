@@ -1,7 +1,5 @@
-from fastapi import APIRouter, HTTPException
-from typing import List, Dict
-import yfinance as yf
-import pandas as pd
+from fastapi import APIRouter
+from typing import Dict
 
 router = APIRouter()
 
@@ -27,21 +25,3 @@ async def get_available_indices() -> Dict[str, str]:
         "15": "US S&P 500",
         "16": "Sectoral Indices (NSE)"
     }
-
-@router.get("/data/{symbol}")
-async def get_stock_data(symbol: str, period: str = "1y"):
-    """Get stock data for a specific symbol"""
-    try:
-        stock = yf.Ticker(f"{symbol}.NS")
-        data = stock.history(period=period)
-        
-        if data.empty:
-            raise HTTPException(status_code=404, detail="Stock data not found")
-        
-        return {
-            "symbol": symbol,
-            "data": data.to_dict('records'),
-            "info": stock.info
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))

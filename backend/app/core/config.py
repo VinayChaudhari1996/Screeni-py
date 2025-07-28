@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from typing import List, Optional
+from typing import List
 import os
 
 class Settings(BaseSettings):
@@ -10,31 +10,13 @@ class Settings(BaseSettings):
     DEBUG: bool = True
     
     # Security
-    SECRET_KEY: str = "your-secret-key-here"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
-    ALLOWED_HOSTS: List[str] = ["http://localhost:3000", "http://localhost:5173"]
+    SECRET_KEY: str = "screenipy-secret-key-change-in-production"
     
-    # Database
-    DATABASE_URL: str = "sqlite:///./screenipy.db"
-    
-    # Redis (for caching and job queue)
-    REDIS_URL: str = "redis://localhost:6379"
+    # CORS
+    ALLOWED_HOSTS: List[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:3000"]
     
     # External APIs
     YAHOO_FINANCE_TIMEOUT: int = 10
-    NSE_TIMEOUT: int = 10
-    
-    # ML Models
-    MODEL_PATH: str = "./models"
-    CHROMADB_PATH: str = "./chromadb_store"
-    
-    # File storage
-    UPLOAD_DIR: str = "./uploads"
-    MAX_FILE_SIZE: int = 10 * 1024 * 1024  # 10MB
-    
-    # Screening settings
-    MAX_CONCURRENT_SCREENS: int = 5
-    DEFAULT_CACHE_TTL: int = 3600  # 1 hour
     
     class Config:
         env_file = ".env"
